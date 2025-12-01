@@ -1,24 +1,17 @@
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn import Module
 
 class yoloLoss(Module):
-    def __init__(self, num_class=20):
+    # S와 B를 인자로 받도록 수정
+    def __init__(self, S=7, B=2, num_class=20):
         super(yoloLoss, self).__init__()
-        # 🔹 수정된 하이퍼 파라미터
-        self.lambda_coord = 3.0     # 좌표에 대한 가중 감소
-        self.lambda_noobj = 0.3     # 배경 손실 축소
-        self.lambda_obj = 1.0       # 객체 존재 여부 손실
-        self.lambda_cls = 1.5       # 클래스 손실 비중 증가
-        
-        self.S = 14
-        self.B = 2
+        self.lambda_coord = 5
+        self.lambda_noobj = 0.5
+        self.S = S  
+        self.B = B  
         self.C = num_class
-        self.step = 1.0 / 14
-
-        # 🔹 손실 함수 재정의
-        self.smooth_l1 = torch.nn.SmoothL1Loss(reduction="sum")
+        self.step = 1.0 / self.S
 
     def compute_iou(self, box1, box2, index):
         box1 = torch.clone(box1)
@@ -30,71 +23,75 @@ class yoloLoss(Module):
 
         inter_w = (w1 + w2) - (torch.max(x1 + w1, x2 + w2) - torch.min(x1, x2))
         inter_h = (h1 + h2) - (torch.max(y1 + h1, y2 + h2) - torch.min(y1, y2))
-        inter_h = torch.clamp(inter_h, min=0)
-        inter_w = torch.clamp(inter_w, min=0)
+        inter_w = torch.clamp(inter_w, 0)
+        inter_h = torch.clamp(inter_h, 0)
+
         inter = inter_w * inter_h
-        union = w1 * h1 + w2 * h2 - inter
-        return inter / (union + 1e-6)  # 🔹 small epsilon for stability
+        union = w1 * h1 + w2 * h2 - inter + 1e-6  # 0 나눗셈 방지
+        return inter / union
 
     def conver_box(self, box, index):
         i, j = index
         box[:, 0], box[:, 1] = [(box[:, 0] + i) * self.step - box[:, 2] / 2,
                                 (box[:, 1] + j) * self.step - box[:, 3] / 2]
-        box = torch.clamp(box, min=0)
-        return box
+        return torch.clamp(box, 0, 1)
 
     def forward(self, pred, target):
         batch_size = pred.size(0)
 
-        # 🔹 [B, S, S, 30] → [B, S, S, 2, 5]
-        target_boxes = target[:, :, :, :10].reshape(-1, self.S, self.S, 2, 5)
-        pred_boxes = pred[:, :, :, :10].reshape(-1, self.S, self.S, 2, 5)
-        target_cls = target[:, :, :, 10:]
-        pred_cls = pred[:, :, :, 10:]
+        # bbox [batch, S, S, 2, 5]
+        target_boxes = target[..., :10].contiguous().view(batch_size, self.S, self.S, self.B, 5)
+        pred_boxes = pred[..., :10].contiguous().view(batch_size, self.S, self.S, self.B, 5)
 
+        # class [batch, S, S, C]
+        target_cls = target[..., 10:]
+        pred_cls = pred[..., 10:]
+
+        # obj mask
         obj_mask = (target_boxes[..., 4] > 0).bool()
-        sig_mask = obj_mask[..., 1]  # [B, 14, 14]
-        index = torch.where(sig_mask)
+        sig_mask = obj_mask.any(dim=-1)  # [batch, S, S], object 있는 cell
 
-        for b, y, x in zip(*index):
-            b, y, x = b.item(), y.item(), x.item()
-            ious = self.compute_iou(pred_boxes[b, y, x, :, :4],
-                                    target_boxes[b, y, x, :, :4],
-                                    [x, y])
+        # IOU 기반 bbox 선택
+        index = torch.where(sig_mask)
+        for img_i, y, x in zip(*index):
+            img_i, y, x = int(img_i), int(y), int(x)
+            pbox = pred_boxes[img_i, y, x]
+            tbox = target_boxes[img_i, y, x]
+            ious = self.compute_iou(pbox[:, :4], tbox[:, :4], [x, y])
             _, max_i = ious.max(0)
-            obj_mask[b, y, x, 1 - max_i] = 0
+            obj_mask[img_i, y, x, 1 - max_i] = False
 
         noobj_mask = ~obj_mask
 
-        # 🔸 no‑object confidence loss
-        noobj_loss = F.mse_loss(pred_boxes[noobj_mask][:, 4],
-                                target_boxes[noobj_mask][:, 4],
+        # confidence loss
+        noobj_loss = F.mse_loss(pred_boxes[noobj_mask][..., 4],
+                                target_boxes[noobj_mask][..., 4],
                                 reduction="sum")
-
-        # 🔸 object confidence loss
-        obj_loss = F.mse_loss(pred_boxes[obj_mask][:, 4],
-                              target_boxes[obj_mask][:, 4],
+        obj_loss = F.mse_loss(pred_boxes[obj_mask][..., 4],
+                              target_boxes[obj_mask][..., 4],
                               reduction="sum")
 
-        # 🔸 coordinate loss (SmoothL1)
-        xy_loss = self.smooth_l1(pred_boxes[obj_mask][:, :2],
-                                 target_boxes[obj_mask][:, :2])
+        # xy loss
+        xy_loss = F.mse_loss(pred_boxes[obj_mask][..., :2],
+                             target_boxes[obj_mask][..., :2],
+                             reduction="sum")
 
-        # 🔸 width/height 안정화 (sqrt 값 손실)
-        wh_loss = self.smooth_l1(torch.sqrt(torch.clamp(pred_boxes[obj_mask][:, 2:4], min=1e-6)),
-                                 torch.sqrt(torch.clamp(target_boxes[obj_mask][:, 2:4], min=1e-6)))
+        # wh loss (sqrt)
+        pred_wh = pred_boxes[obj_mask][..., 2:4]
+        pred_wh = torch.clamp(pred_wh, min=0)
+        wh_loss = F.mse_loss(torch.sqrt(target_boxes[obj_mask][..., 2:4] + 1e-6),
+                             torch.sqrt(pred_wh + 1e-6),
+                             reduction="sum")
 
-        # 🔸 class prediction loss
-        class_loss = F.cross_entropy(pred_cls[sig_mask],
-                                     target_cls[sig_mask].argmax(dim=1),
-                                     reduction="sum")
+        # class loss
+        sig_mask_exp = sig_mask.unsqueeze(-1).expand_as(pred_cls)
+        class_loss = F.mse_loss(pred_cls[sig_mask_exp].view(-1, self.C),
+                                target_cls[sig_mask_exp].view(-1, self.C),
+                                reduction="sum")
 
-        # 🔹 total loss (정규화 포함)
-        total_loss = (
-            self.lambda_coord * (xy_loss + wh_loss) +
-            self.lambda_obj * obj_loss +
-            self.lambda_noobj * noobj_loss +
-            self.lambda_cls * class_loss
-        ) / batch_size
+        # total loss
+        loss = obj_loss + self.lambda_noobj * noobj_loss + \
+               self.lambda_coord * xy_loss + self.lambda_coord * wh_loss + \
+               class_loss
 
-        return total_loss
+        return loss / batch_size
