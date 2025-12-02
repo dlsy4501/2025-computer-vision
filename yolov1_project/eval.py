@@ -152,12 +152,15 @@ if __name__ == '__main__':
     print('DONE.\n')
     print('START TESTING...')
 
-    model = resnet50().to(device)
+    from nets.yolo_resnet import YOLOv1_ResNet  # 클래스 import 추가
+
+    # 학습할 때 설정한 파라미터(S=7, B=2 등)와 동일하게 맞춰야 합니다.
+    model = YOLOv1_ResNet(num_classes=20, S=7, B=2).to(device)
 
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
-    model.load_state_dict(torch.load('./weights/yolov1_final.pth')['state_dict'])
+    model.load_state_dict(torch.load('./weights/yolov1_0050.pth')['state_dict'])
     model.eval()
     
     # image_list = image_list[:500]
