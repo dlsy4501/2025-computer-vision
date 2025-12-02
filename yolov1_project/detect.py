@@ -1,16 +1,27 @@
 import os
-
 import cv2
-
 import torch
 import torch.nn as nn
-
-from nets.nn import resnet50
-from utils.util import predict
-
 import argparse
-
 import matplotlib.pyplot as plt
+import sys
+
+# ==========================================
+# [1. 경로 자동 설정]
+# detect.py가 있는 폴더(yolov1/yolov1)와 상위 폴더(yolov1)를 연결
+current_file_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_file_dir)
+if project_root not in sys.path:
+    sys.path.append(project_root)
+# ==========================================
+
+# 이제 nets와 utils를 정상적으로 불러올 수 있습니다.
+try:
+    from nets.yolo_resnet import YOLOv1_ResNet
+    from utils.util import predict
+except ImportError:
+    print("Error: 모듈을 찾을 수 없습니다. (nets 또는 utils)")
+    sys.exit()
 
 VOC_CLASSES = ['aeroplane', 'bicycle', 'bird', 'boat',
                'bottle', 'bus', 'car', 'cat', 'chair',
@@ -43,24 +54,52 @@ COLORS = {'aeroplane': (0, 0, 0),
 
 def detect(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = resnet50().to(device)
-
+    
     print('LOADING MODEL...')
+    # === [핵심 수정] resnet50() -> YOLOv1_ResNet() 교체 ===
+    # 가중치 파일 구조(backbone...)와 일치하는 클래스를 사용해야 합니다.
+    model = YOLOv1_ResNet(num_classes=20, S=7, B=2).to(device)
+
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
-    # if you have single gpu then please modify model loading process
-    #model.load_state_dict(torch.load('./weights/yolov1_0140.pth')['state_dict'])
-    model.load_state_dict(torch.load('./weights/'+ args.weight)['state_dict'])
+    # 가중치 로드
+    weight_path = os.path.join(project_root, 'weights', args.weight)
+    
+    # 경로 안전장치: args로 입력받은 파일이 없으면 기본 경로 확인
+    if not os.path.exists(weight_path):
+         # detect.py가 있는 폴더 기준 weights 확인
+         weight_path = os.path.join(current_file_dir, 'weights', args.weight)
+    
+    try:
+        print(f"Loading weights from: {weight_path}")
+        checkpoint = torch.load(weight_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['state_dict'])
+    except FileNotFoundError:
+        print(f"Error: 가중치 파일을 찾을 수 없습니다 -> {weight_path}")
+        return
+    except RuntimeError as e:
+        print(f"Error: 모델 구조 불일치. ({e})")
+        return
+
     model.eval()
+    
     with torch.no_grad():
-        image_name = "./Dataset/Images/" + args.image
-        #image = cv2.imread(image_name)
-        image = cv2.imread(image_name)
+        # 이미지 경로 설정 (Dataset/Images 폴더가 project_root에 있다고 가정)
+        image_path = os.path.join(project_root, 'yolov1', 'assets', args.image)
+        
+        if not os.path.exists(image_path):
+             print(f"Error: 이미지를 찾을 수 없습니다 -> {image_path}")
+             return
 
-        print('\nPREDICTING...')
-        result = predict(model, image_name)
+        image = cv2.imread(image_path)
+        print(f'\nPREDICTING {image_path}...')
+        
+        # util.py의 predict 함수 호출
+        # (root_path 없이 전체 경로를 넘겨줍니다)
+        result = predict(model, image_path)
 
+    # 결과 시각화
     for x1y1, x2y2, class_name, _, prob in result:
         color = COLORS[class_name]
         cv2.rectangle(image, x1y1, x2y2, color, 2)
@@ -74,22 +113,22 @@ def detect(args):
         cv2.putText(image, label, (p1[0], p1[1] + baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, 8)
 
     if args.save_img:
-        cv2.imwrite('./result.jpg', image)
+        save_path = os.path.join(project_root, 'result.jpg')
+        cv2.imwrite(save_path, image)
+        print(f"Result saved to {save_path}")
 
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     plt.imshow(image)
     plt.show()
-    #cv2.imshow('Prediction', image)
-    #cv2.waitKey(0)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--image', default='000001.jpg', required=False, help='Path to Image file')
+    parser.add_argument('--image', default='person.jpg', required=False, help='Path to Image file')
     parser.add_argument('--save_img', action='store_true', help='Save the Image after detection')
     parser.add_argument('--video', default='', required=False, help='Path to Video file')  # maybe later
-    parser.add_argument('--weight', default='yolov1_final.pth', required=False, help='Path to Video file')  # maybe later
+    parser.add_argument('--weight', default='yolov1_final.pth', required=False, help='Path to weight file') 
     args = parser.parse_args()
 
     detect(args)
